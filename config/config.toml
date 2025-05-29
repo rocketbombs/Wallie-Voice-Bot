@@ -1,0 +1,62 @@
+# Wallie Voice Bot Configuration
+# Place in ~/.wallie_voice_bot/config.toml
+
+# Wake Word Detection
+wake_word = "wallie"
+wake_word_sensitivity = 0.7  # 0.0-1.0, higher = more sensitive
+
+# ASR (Speech Recognition)
+asr_model = "tiny.en"  # tiny.en, base.en, small.en, medium.en, large-v3
+asr_device = "cuda"    # cuda or cpu
+asr_compute_type = "float16"  # float16, int8, float32
+
+# LLM (Language Model)
+llm_model = "meta-llama/Llama-3.2-3B-Instruct"
+llm_max_tokens = 512
+llm_temperature = 0.7
+llm_gpu_memory_fraction = 0.4  # Fraction of GPU memory to allocate
+
+# TTS (Text-to-Speech)
+tts_engine = "auto"  # auto, edge, pyttsx3, coqui
+# edge: High-quality online voices (requires internet)
+# pyttsx3: Fast offline synthesis
+# coqui: Advanced offline (Python <3.12 only)
+
+# For edge-tts voices, see: edge-tts --list-voices
+tts_voice = "en-US-AriaNeural"  # Female voice
+# Alternative voices:
+# en-US-ChristopherNeural (male)
+# en-US-JennyNeural (female)
+# en-GB-SoniaNeural (British female)
+
+tts_speaker_wav = ""  # Voice cloning (coqui only)
+tts_language = "en"
+
+# Audio Configuration
+audio_sample_rate = 16000
+audio_chunk_size = 512
+
+# Watchdog Configuration
+watchdog_interval_sec = 2
+watchdog_max_restarts = 3
+
+# Monitoring
+enable_prometheus = false
+prometheus_port = 9090
+
+# Privacy & Logging
+archive_transcripts = false  # Set true to keep transcripts
+log_retention_hours = 24
+
+# Performance Tuning
+[latency_budgets]
+asr_first_partial_ms = 90
+llm_prefill_ms = 110
+llm_mean_token_ms = 9
+tts_first_chunk_ms = 30
+
+# System Limits
+[system]
+max_conversation_turns = 4  # Number of turns to keep in memory
+max_audio_buffer_sec = 30   # Maximum audio to buffer
+gpu_oom_retry_count = 2     # Number of OOM recovery attempts
