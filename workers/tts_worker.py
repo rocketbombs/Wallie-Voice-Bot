@@ -79,6 +79,10 @@ class TTSWorker:
         self.first_chunk_latencies = []
         self.total_audio_duration = 0.0
         
+        # Use dedicated control queue
+        self.control_queue = queues['tts_control']
+        self.running = True
+        
     def _setup_logging(self) -> logging.Logger:
         """Setup worker-specific logging"""
         logger = logging.getLogger("wallie.tts")
@@ -89,14 +93,16 @@ class TTSWorker:
         """Initialize TTS with fallback options"""
         # Auto-select best available engine
         if self.tts_engine == 'auto':
-            if EDGE_TTS_AVAILABLE:
-                self.tts_engine = 'edge'
-            elif PYTTSX3_AVAILABLE:
+            if PYTTSX3_AVAILABLE:
                 self.tts_engine = 'pyttsx3'
-            elif TTS_AVAILABLE:
+            elif EDGE_TTS_AVAILABLE:
+                self.tts_engine = 'edge'
+            elif TTS_AVAILABLE and torch.cuda.is_available():
                 self.tts_engine = 'coqui'
             else:
-                raise RuntimeError("No TTS engine available!")
+                self.logger.error("No TTS engine available!")
+                # Use a simple fallback
+                self.tts_engine = 'dummy'
         
         # Initialize selected engine
         if self.tts_engine == 'edge' and EDGE_TTS_AVAILABLE:
@@ -133,12 +139,20 @@ class TTSWorker:
                 self.initialize_tts()
                 return
         
+        elif self.tts_engine == 'dummy':
+            self.logger.warning("Using dummy TTS (no audio output)")
+            self.tts_engine_name = 'dummy'
+        
         else:
-            raise RuntimeError(f"TTS engine '{self.tts_engine}' not available")
+            self.logger.error(f"TTS engine '{self.tts_engine}' not available, using dummy")
+            self.tts_engine = 'dummy'
+            self.tts_engine_name = 'dummy'
         
         # Warm up
-        self.logger.info(f"Warming up {self.tts_engine_name}...")
-        self._synthesize_text("Hello, I am ready.", streaming=False)
+        if self.tts_engine_name != 'dummy':
+            self.logger.info(f"Warming up {self.tts_engine_name}...")
+            self._synthesize_text("Hello, I am ready.", streaming=False)
+        
         self.logger.info("TTS ready")
     
     def _synthesize_text(self, text: str, streaming: bool = True) -> Optional[np.ndarray]:
@@ -157,6 +171,10 @@ class TTSWorker:
             elif self.tts_engine_name == 'coqui':
                 # Coqui TTS
                 audio = self._synthesize_coqui(text)
+                
+            elif self.tts_engine_name == 'dummy':
+                # Dummy audio
+                audio = self._synthesize_dummy(text)
             
             else:
                 return None
@@ -176,8 +194,6 @@ class TTSWorker:
     
     async def _synthesize_edge(self, text: str) -> Optional[np.ndarray]:
         """Synthesize using Edge TTS"""
-        import edge_tts
-        
         # Create communication object
         tts = edge_tts.Communicate(text, self.voice_name)
         
@@ -226,6 +242,13 @@ class TTSWorker:
         
         return wav
     
+    def _synthesize_dummy(self, text: str) -> Optional[np.ndarray]:
+        """Generate dummy audio for testing"""
+        # Generate silence of appropriate length
+        duration = len(text) * 0.05  # ~50ms per character
+        samples = int(duration * self.output_sample_rate)
+        return np.zeros(samples, dtype=np.float32)
+    
     def audio_playback_thread(self):
         """Background thread for audio playback"""
         try:
@@ -240,9 +263,10 @@ class TTSWorker:
                     if audio_chunk is None:  # Stop signal
                         break
                     
-                    # Play audio directly
-                    sd.play(audio_chunk, self.output_sample_rate)
-                    sd.wait()  # Wait for playback to finish
+                    # Play audio directly (skip for dummy engine)
+                    if self.tts_engine_name != 'dummy':
+                        sd.play(audio_chunk, self.output_sample_rate)
+                        sd.wait()  # Wait for playback to finish
                     
                 except queue.Empty:
                     continue
@@ -280,7 +304,7 @@ class TTSWorker:
             
             # Check for abort signal
             try:
-                abort_msg = self.queues['control'].get_nowait()
+                abort_msg = self.control_queue.get_nowait()
                 if abort_msg.get('type') == 'abort':
                     self.logger.info("TTS aborted")
                     self.stop_playback()
@@ -353,7 +377,10 @@ class TTSWorker:
         self.audio_queue.put(None)
         
         # Stop any current playback
-        sd.stop()
+        try:
+            sd.stop()
+        except:
+            pass
         
         # Wait for thread to finish
         if self.playback_thread and self.playback_thread.is_alive():
@@ -380,7 +407,7 @@ class TTSWorker:
             self.initialize_tts()
             
             # Report ready
-            self.queues['control'].put({
+            self.control_queue.put({
                 'type': 'ready',
                 'worker': 'tts',
                 'timestamp': time.time()
@@ -388,20 +415,22 @@ class TTSWorker:
             
             self.logger.info("TTS worker started")
             
+            last_metrics_time = time.time()
+            
             # Main message handling loop
-            while True:
+            while self.running:
                 try:
                     # Check LLM queue
                     try:
                         llm_msg = self.queues['llm_to_tts'].get(timeout=0.1)
                         if llm_msg.get('type') == 'llm_response':
                             self.process_llm_response(llm_msg)
-                    except queue.Empty:
+                    except:
                         pass
                     
                     # Check control queue
                     try:
-                        control_msg = self.queues['control'].get_nowait()
+                        control_msg = self.control_queue.get_nowait()
                         self.handle_control_message(control_msg)
                     except:
                         pass
@@ -412,9 +441,12 @@ class TTSWorker:
                         if avg_latency > 30:  # Budget exceeded
                             self.logger.warning(f"First chunk latency {avg_latency:.1f}ms exceeds budget")
                     
-                    # Log metrics
-                    if int(time.time()) % 30 == 0 and self.synthesis_count > 0:
-                        avg_first_chunk = sum(self.first_chunk_latencies) / len(self.first_chunk_latencies) if self.first_chunk_latencies else 0
+                    # Log metrics every 30 seconds
+                    if time.time() - last_metrics_time >= 30:
+                        if self.first_chunk_latencies:
+                            avg_first_chunk = sum(self.first_chunk_latencies) / len(self.first_chunk_latencies)
+                        else:
+                            avg_first_chunk = 0
                         
                         self.logger.info("TTS metrics", extra={
                             "stage": "tts",
@@ -423,6 +455,7 @@ class TTSWorker:
                             "avg_first_chunk_ms": avg_first_chunk,
                             "engine": self.tts_engine_name
                         })
+                        last_metrics_time = time.time()
                     
                 except KeyboardInterrupt:
                     break
@@ -430,6 +463,9 @@ class TTSWorker:
                     self.logger.error(f"TTS worker error: {e}", exc_info=True)
                     time.sleep(0.1)
             
+        except Exception as e:
+            self.logger.error(f"TTS worker fatal error: {e}")
         finally:
+            self.running = False
             self.stop_playback()
             self.logger.info("TTS worker stopped")

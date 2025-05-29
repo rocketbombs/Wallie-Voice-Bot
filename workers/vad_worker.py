@@ -6,7 +6,6 @@ Continuously monitors audio for "wallie" trigger
 import time
 import numpy as np
 import sounddevice as sd
-import pvporcupine
 from typing import Optional, Dict, Any
 import multiprocessing as mp
 import logging
@@ -14,7 +13,16 @@ import json
 from pathlib import Path
 import struct
 import threading
-import queue as Queue
+import queue
+import os
+
+# Try to import pvporcupine
+PORCUPINE_AVAILABLE = False
+try:
+    import pvporcupine
+    PORCUPINE_AVAILABLE = True
+except ImportError:
+    pass
 
 class VADWorker:
     """Voice Activity Detection with Porcupine wake word"""
@@ -57,8 +65,11 @@ class VADWorker:
         self.audio_overruns = 0
         
         # Audio processing queue
-        self.audio_queue = Queue.Queue()
+        self.audio_queue = queue.Queue()
         self.running = True
+        
+        # Use dedicated control queue
+        self.control_queue = queues['vad_control']
         
     def _setup_logging(self) -> logging.Logger:
         """Setup worker-specific logging"""
@@ -68,13 +79,15 @@ class VADWorker:
     
     def initialize_porcupine(self):
         """Initialize Porcupine wake word engine"""
-        try:
-            import os
+        if not PORCUPINE_AVAILABLE:
+            self.logger.warning("Porcupine not available, using energy-based VAD")
+            return
             
+        try:
             # Check for API key
             if not os.environ.get('PV_ACCESS_KEY'):
-                self.logger.error("PV_ACCESS_KEY environment variable not set!")
-                raise ValueError("Porcupine API key required")
+                self.logger.warning("PV_ACCESS_KEY environment variable not set! Using energy-based VAD")
+                return
             
             # Try custom wake word first
             wake_word_path = Path.home() / ".wallie_voice_bot" / "wake_words" / f"{self.wake_word}.ppn"
@@ -110,7 +123,7 @@ class VADWorker:
             
         except Exception as e:
             self.logger.error(f"Failed to initialize Porcupine: {e}")
-            raise
+            self.porcupine = None
     
     def audio_callback(self, indata: np.ndarray, frames: int, time_info: Dict, status: sd.CallbackFlags):
         """Process incoming audio frames"""
@@ -133,12 +146,18 @@ class VADWorker:
             
             if not self.listening_for_speech:
                 # Check for wake word
-                try:
-                    keyword_index = self.porcupine.process(frame)
-                    if keyword_index >= 0:
+                if self.porcupine:
+                    try:
+                        keyword_index = self.porcupine.process(frame)
+                        if keyword_index >= 0:
+                            self.handle_wake_word_detected()
+                    except Exception as e:
+                        self.logger.error(f"Porcupine process error: {e}")
+                else:
+                    # Energy-based trigger
+                    energy = calculate_energy(frame)
+                    if energy > 0.1:  # Higher threshold for wake detection
                         self.handle_wake_word_detected()
-                except Exception as e:
-                    self.logger.error(f"Porcupine process error: {e}")
             else:
                 # Send audio to ASR
                 self.process_speech_audio(frame)
@@ -148,9 +167,9 @@ class VADWorker:
         self.wake_word_count += 1
         self.logger.info(f"Wake word detected (#{self.wake_word_count})")
         
-        # Send interrupt signal to main daemon
+        # Send interrupt signal through control queue
         try:
-            self.queues['control'].put_nowait({
+            self.control_queue.put_nowait({
                 'type': 'wake_word_detected',
                 'timestamp': time.time(),
                 'count': self.wake_word_count
@@ -175,7 +194,7 @@ class VADWorker:
     def process_speech_audio(self, frame: np.ndarray):
         """Process audio during speech recognition"""
         # Simple energy-based speech detection
-        energy = np.sqrt(np.mean(frame.astype(np.float32) ** 2))
+        energy = calculate_energy(frame)
         
         if energy > self.silence_threshold:
             self.last_speech_time = time.time()
@@ -188,7 +207,7 @@ class VADWorker:
                 'timestamp': time.time(),
                 'is_first': False
             })
-        except mp.queues.Full:
+        except:
             self.logger.warning("ASR queue full, dropping audio")
         
         # Check for end of speech
@@ -217,7 +236,16 @@ class VADWorker:
     
     def handle_control_message(self, msg: Dict[str, Any]):
         """Handle control messages from main daemon"""
-        if msg.get('type') == 'config_reload':
+        msg_type = msg.get('type')
+        
+        if msg_type == 'abort':
+            # Reset state
+            self.listening_for_speech = False
+            self.speech_start_time = None
+            self.last_speech_time = None
+            self.logger.info("VAD aborted")
+            
+        elif msg_type == 'config_reload':
             new_config = msg.get('config', {})
             self.sensitivity = new_config.get('wake_word_sensitivity', self.sensitivity)
             
@@ -236,7 +264,7 @@ class VADWorker:
             self.initialize_porcupine()
             
             # Report ready
-            self.queues['control'].put({
+            self.control_queue.put({
                 'type': 'ready',
                 'worker': 'vad',
                 'timestamp': time.time()
@@ -252,22 +280,26 @@ class VADWorker:
             ):
                 self.logger.info("VAD worker started, listening for wake word...")
                 
+                last_metrics_time = time.time()
+                
                 # Main loop - handle control messages
-                while True:
+                while self.running:
                     try:
                         # Non-blocking check for control messages
-                        msg = self.queues['control'].get(timeout=0.1)
+                        msg = self.control_queue.get(timeout=0.1)
                         self.handle_control_message(msg)
                     except:
                         pass
                     
                     # Log periodic metrics
-                    if int(time.time()) % 30 == 0:
+                    if time.time() - last_metrics_time >= 30:
                         self.logger.info("VAD metrics", extra={
                             "stage": "vad",
                             "wake_word_count": self.wake_word_count,
-                            "audio_overruns": self.audio_overruns
+                            "audio_overruns": self.audio_overruns,
+                            "using_porcupine": self.porcupine is not None
                         })
+                        last_metrics_time = time.time()
                     
                     time.sleep(0.01)
                     
@@ -278,6 +310,7 @@ class VADWorker:
         finally:
             if self.porcupine:
                 self.porcupine.delete()
+            self.running = False
             self.logger.info("VAD worker stopped")
 
 # Energy-based VAD utilities

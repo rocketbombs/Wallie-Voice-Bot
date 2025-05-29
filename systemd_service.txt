@@ -1,0 +1,55 @@
+[Unit]
+Description=Wallie Voice Bot - Offline Voice Assistant
+Documentation=https://github.com/yourusername/wallie-voice-bot
+After=network.target sound.target
+
+[Service]
+Type=forking
+User=%i
+Group=audio
+WorkingDirectory=/home/%i/wallie-voice-bot
+
+# Environment
+Environment="HOME=/home/%i"
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+# Add your Porcupine API key here or in /etc/environment
+# Environment="PV_ACCESS_KEY=your-key-here"
+
+# Start command
+ExecStart=/usr/bin/python3 /home/%i/wallie-voice-bot/wallie_voice_bot.py --daemon
+
+# PID file
+PIDFile=/home/%i/.wallie_voice_bot/wallie.pid
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitInterval=60s
+
+# Resource limits
+# Limit memory to prevent OOM on small devices
+MemoryLimit=4G
+CPUQuota=80%
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/%i/.wallie_voice_bot
+
+# Audio access
+SupplementaryGroups=audio
+PrivateDevices=false
+DeviceAllow=/dev/snd rw
+DeviceAllow=/dev/nvidia* rw
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wallie
+
+[Install]
+WantedBy=multi-user.target

@@ -9,10 +9,9 @@ from typing import Optional, Dict, Any, List
 import multiprocessing as mp
 import logging
 from faster_whisper import WhisperModel
-import queue as Queue  # Add at top of file with other imports
+import queue
 import threading
 from collections import deque
-import asyncio
 
 class ASRWorker:
     """Streaming ASR with faster-whisper"""
@@ -42,21 +41,24 @@ class ASRWorker:
         
         # Audio buffer
         self.audio_buffer = deque(maxlen=self.sample_rate * 30)  # 30s max
-        self.processing_queue = Queue.Queue()
+        self.processing_queue = queue.Queue()
         
         # Model instance
         self.model: Optional[WhisperModel] = None
         
         # Performance tracking
-        self.transcription_count = 0
-        self.total_audio_processed = 0.0
-        self.first_partial_latencies = []
+        self.metrics = {
+            'transcription_count': 0,
+            'audio_processed_sec': 0.0,
+            'first_partial_latency_ms': []
+        }
         
         # Precision downgrade flag
         self.precision_downgraded = False
         
-        self.control_queue = queues['asr_control']  # Use dedicated control queue
-        self.running = True  # Add process state
+        # Use dedicated control queue
+        self.control_queue = queues['asr_control']
+        self.running = True
         
     def _setup_logging(self) -> logging.Logger:
         """Setup worker-specific logging"""
@@ -144,7 +146,7 @@ class ASRWorker:
             # Track first partial latency
             if is_first and text:
                 latency_ms = (time.perf_counter() - start_time) * 1000
-                self.first_partial_latencies.append(latency_ms)
+                self.metrics['first_partial_latency_ms'].append(latency_ms)
                 self.logger.info(f"First partial in {latency_ms:.1f}ms: {text[:50]}...")
             
             return text
@@ -157,7 +159,7 @@ class ASRWorker:
         """Background thread for processing audio chunks"""
         overlapping_audio = np.array([], dtype=np.float32)
         
-        while True:
+        while self.running:
             try:
                 # Get audio chunk from queue
                 chunk_data = self.processing_queue.get(timeout=1.0)
@@ -193,7 +195,7 @@ class ASRWorker:
                     except:
                         pass
                 
-            except Queue.Empty:
+            except queue.Empty:
                 continue
             except Exception as e:
                 self.logger.error(f"Audio processing error: {e}")
@@ -249,66 +251,32 @@ class ASRWorker:
                     except:
                         pass
                 
-                self.transcription_count += 1
-                self.total_audio_processed += msg.get('duration', 0)
+                self.metrics['transcription_count'] += 1
+                self.metrics['audio_processed_sec'] += msg.get('duration', 0)
     
-    async def handle_control_messages(self):
-        """Async handler for control messages"""
-        while True:
-            try:
-                msg = await self.get_control_message()
-                if msg:
-                    msg_type = msg.get('type')
-                    
-                    if msg_type == 'abort':
-                        await self.handle_abort()
-                    elif msg_type == 'config_reload':
-                        await self.handle_config_reload(msg.get('config', {}))
-            except Exception as e:
-                self.logger.error(f"Control message error: {e}")
-            await asyncio.sleep(0.01)
-    
-    async def get_control_message(self) -> Optional[Dict[str, Any]]:
-        """Non-blocking control message check"""
-        try:
-            return self.control_queue.get_nowait()
-        except Queue.Empty:
-            return None
+    def handle_control_message(self, msg: Dict[str, Any]):
+        """Handle control messages"""
+        msg_type = msg.get('type')
         
-    async def handle_abort(self):
-        """Handle abort request"""
-        self.audio_buffer.clear()
-        while not self.processing_queue.empty():
-            try:
-                self.processing_queue.get_nowait()
-            except:
-                break
-        self.logger.info("ASR aborted")
-    
-    async def handle_config_reload(self, new_config: Dict[str, Any]):
-        """Handle config reload"""
-        new_model = new_config.get('asr_model')
-        if new_model and new_model != self.model_size:
-            self.model_size = new_model
-            await self.initialize_model()
-    
-    def downgrade_precision(self):
-        """Downgrade model precision for performance"""
-        if not self.precision_downgraded:
-            self.logger.warning("Downgrading ASR precision for performance")
-            self.precision_downgraded = True
+        if msg_type == 'abort':
+            # Clear buffers
+            self.audio_buffer.clear()
+            while not self.processing_queue.empty():
+                try:
+                    self.processing_queue.get_nowait()
+                except:
+                    break
+            self.logger.info("ASR aborted")
             
-            if self.compute_type == 'float16':
-                self.compute_type = 'int8'
-            elif self.device == 'cuda':
-                self.device = 'cpu'
-                self.compute_type = 'int8'
-            
-            # Reinitialize model
-            self.initialize_model()
+        elif msg_type == 'config_reload':
+            new_config = msg.get('config', {})
+            new_model = new_config.get('asr_model')
+            if new_model and new_model != self.model_size:
+                self.model_size = new_model
+                self.initialize_model()
     
     def start(self):
-        """Main worker loop with async support"""
+        """Main worker loop"""
         try:
             # Initialize model
             self.initialize_model()
@@ -318,18 +286,8 @@ class ASRWorker:
                 target=self.audio_processing_thread,
                 name="asr_processor"
             )
-            processor_thread.daemon = True  # Ensure thread exits with process
+            processor_thread.daemon = True
             processor_thread.start()
-            
-            # Initialize asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            # Start async tasks
-            tasks = [
-                loop.create_task(self.handle_control_messages()),
-                loop.create_task(self.process_audio_stream())
-            ]
             
             # Signal ready
             self.control_queue.put({
@@ -338,52 +296,53 @@ class ASRWorker:
                 'timestamp': time.time()
             })
             
-            # Run until stopped
+            last_metrics_time = time.time()
+            
+            # Main loop
             while self.running:
                 try:
-                    loop.run_until_complete(asyncio.gather(*tasks))
-                except asyncio.CancelledError:
+                    # Process messages from VAD
+                    try:
+                        msg = self.queues['vad_to_asr'].get(timeout=0.1)
+                        if msg:
+                            self.handle_vad_message(msg)
+                    except:
+                        pass
+                    
+                    # Check control messages
+                    try:
+                        control_msg = self.control_queue.get_nowait()
+                        if control_msg:
+                            self.handle_control_message(control_msg)
+                    except:
+                        pass
+                    
+                    # Log metrics every 30 seconds
+                    if time.time() - last_metrics_time >= 30:
+                        if self.metrics['first_partial_latency_ms']:
+                            avg_latency = sum(self.metrics['first_partial_latency_ms'][-5:]) / min(5, len(self.metrics['first_partial_latency_ms'][-5:]))
+                        else:
+                            avg_latency = 0
+                            
+                        self.logger.info("ASR metrics", extra={
+                            'stage': 'asr',
+                            'transcription_count': self.metrics['transcription_count'],
+                            'audio_processed_sec': self.metrics['audio_processed_sec'],
+                            'avg_first_partial_ms': avg_latency
+                        })
+                        last_metrics_time = time.time()
+                        
+                except KeyboardInterrupt:
                     break
+                except Exception as e:
+                    self.logger.error(f"ASR worker error: {e}")
+                    time.sleep(0.1)
             
         except Exception as e:
-            self.logger.error(f"ASR worker error: {e}")
+            self.logger.error(f"ASR worker fatal error: {e}")
         finally:
             self.running = False
             self.cleanup()
-    
-    async def process_audio_stream(self):
-        """Process audio stream with metrics"""
-        last_metrics_time = time.time()
-        
-        while True:
-            try:
-                # Process messages from VAD
-                try:
-                    msg = self.queues['vad_to_asr'].get_nowait()
-                    if msg:
-                        self.handle_vad_message(msg)
-                except queue.Empty:
-                    pass
-                
-                # Log metrics every 30 seconds
-                if time.time() - last_metrics_time >= 30:
-                    self.logger.info("ASR metrics", extra={
-                        'stage': 'asr',
-                        'transcription_count': self.metrics['transcription_count'],
-                        'audio_processed_sec': self.metrics['audio_processed_sec'],
-                        'avg_first_partial_ms': (
-                            sum(self.metrics['first_partial_latency_ms'][-5:]) / 
-                            len(self.metrics['first_partial_latency_ms'][-5:])
-                            if self.metrics['first_partial_latency_ms'] else 0
-                        )
-                    })
-                    last_metrics_time = time.time()
-                    
-                await asyncio.sleep(0.01)  # Prevent CPU spin
-                
-            except Exception as e:
-                self.logger.error(f"Audio stream processing error: {e}")
-                await asyncio.sleep(0.1)  # Back off on error
     
     def cleanup(self):
         """Clean up resources"""
@@ -394,23 +353,24 @@ class ASRWorker:
                 self.processing_queue.put(None)
             
             # Clear buffers
-            self.audio_buffer.clear()
+            if hasattr(self, 'audio_buffer'):
+                self.audio_buffer.clear()
             
             # Clean up model
             if self.model is not None:
                 del self.model
             
             # Log final metrics
-            if hasattr(self, 'metrics'):
-                self.logger.info("ASR final metrics", extra={
-                    'stage': 'asr',
-                    'total_transcriptions': self.metrics['transcription_count'],
-                    'total_audio_processed': self.metrics['audio_processed_sec'],
-                    'avg_first_partial_ms': (
-                        sum(self.metrics['first_partial_latency_ms']) / 
-                        len(self.metrics['first_partial_latency_ms'])
-                        if self.metrics['first_partial_latency_ms'] else 0
-                    )
-                })
+            if hasattr(self, 'metrics') and self.metrics['first_partial_latency_ms']:
+                avg_latency = sum(self.metrics['first_partial_latency_ms']) / len(self.metrics['first_partial_latency_ms'])
+            else:
+                avg_latency = 0
+                
+            self.logger.info("ASR final metrics", extra={
+                'stage': 'asr',
+                'total_transcriptions': self.metrics.get('transcription_count', 0),
+                'total_audio_processed': self.metrics.get('audio_processed_sec', 0),
+                'avg_first_partial_ms': avg_latency
+            })
         except Exception as e:
             self.logger.error(f"Cleanup error: {e}")

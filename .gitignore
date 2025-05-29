@@ -1,0 +1,92 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Wallie specific
+~/.wallie_voice_bot/
+logs/
+*.log
+*.jsonl
+*.pid
+config.toml
+!example.config.toml
+
+# Model cache
+models/
+model_cache/
+*.bin
+*.pth
+*.pt
+*.onnx
+*.safetensors
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+recordings/
+
+# Credentials
+.env
+*.key
+*_key.txt
+PV_ACCESS_KEY
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+cache/
+
+# Test coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Documentation
+docs/_build/
+site/
+
+# OS specific
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.Spotlight-V100
+.Trashes

@@ -9,3 +9,5 @@ from .llm_worker import LLMWorker
 from .tts_worker import TTSWorker
 
 __all__ = ['VADWorker', 'ASRWorker', 'LLMWorker', 'TTSWorker']
+
+__version__ = '0.1.0'

@@ -4,7 +4,6 @@ Target: ≤110ms prefill, ≤9ms per token
 """
 
 import time
-import asyncio
 from typing import Optional, Dict, Any, List, Tuple
 import multiprocessing as mp
 import logging
@@ -30,7 +29,6 @@ class LLMWorker:
     @staticmethod
     def run(config: Dict[str, Any], queues: Dict[str, mp.Queue]):
         """Main worker process entry point"""
-        # vLLM requires asyncio event loop
         worker = LLMWorker(config, queues)
         worker.start()
     
@@ -46,12 +44,7 @@ class LLMWorker:
         self.gpu_memory_fraction = config.get('llm_gpu_memory_fraction', 0.4)
         
         # Check if vLLM is available
-        self.use_vllm = False
-        try:
-            import vllm
-            self.use_vllm = torch.cuda.is_available()
-        except ImportError:
-            pass
+        self.use_vllm = VLLM_AVAILABLE and torch.cuda.is_available()
         
         # Model and sampling
         self.llm = None
@@ -71,6 +64,10 @@ class LLMWorker:
         self.request_queue = queue.Queue()
         self.current_request_id = None
         
+        # Use dedicated control queue
+        self.control_queue = queues['llm_control']
+        self.running = True
+        
         # System prompt
         self.system_prompt = """You are Wallie, a helpful and concise voice assistant. 
 Keep responses brief and natural for spoken conversation. 
@@ -88,10 +85,10 @@ Be friendly but efficient."""
         try:
             self.logger.info(f"Loading LLM: {self.model_name}")
             
-            if not VLLM_AVAILABLE or not torch.cuda.is_available():
+            if not self.use_vllm:
                 self.logger.warning("vLLM not available or no GPU, using CPU fallback")
-                self.use_vllm = False
                 # TODO: Add transformers CPU fallback
+                self._initialize_cpu_model()
                 return
             
             # Initialize vLLM
@@ -136,7 +133,31 @@ Be friendly but efficient."""
             
         except Exception as e:
             self.logger.error(f"Failed to initialize LLM: {e}")
-            raise
+            self._initialize_cpu_model()
+    
+    def _initialize_cpu_model(self):
+        """Initialize CPU-based model as fallback"""
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            
+            self.logger.info("Initializing CPU model with transformers")
+            self.use_vllm = False
+            
+            # Use a smaller model for CPU
+            cpu_model_name = "microsoft/phi-2"  # 2.7B model
+            
+            self.tokenizer = AutoTokenizer.from_pretrained(cpu_model_name)
+            self.cpu_model = AutoModelForCausalLM.from_pretrained(
+                cpu_model_name,
+                torch_dtype=torch.float32,
+                device_map="cpu"
+            )
+            
+            self.logger.info("CPU model ready")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize CPU model: {e}")
+            raise RuntimeError("No LLM backend available")
     
     def _build_prompt(self, user_text: str) -> str:
         """Build prompt with conversation history"""
@@ -177,20 +198,28 @@ Be friendly but efficient."""
         # Track prefill start
         prefill_start = time.perf_counter()
         
-        # Generate with vLLM
-        outputs = self.llm.generate(
-            [prompt],
-            self.sampling_params,
-            use_tqdm=False
-        )
-        
-        # Get response
-        response = outputs[0].outputs[0].text.strip()
-        
-        # Calculate metrics
-        prefill_time = (outputs[0].metrics.first_token_time - prefill_start) * 1000
-        total_time = (time.perf_counter() - start_time) * 1000
-        num_tokens = len(outputs[0].outputs[0].token_ids)
+        if self.use_vllm and self.llm:
+            # Generate with vLLM
+            outputs = self.llm.generate(
+                [prompt],
+                self.sampling_params,
+                use_tqdm=False
+            )
+            
+            # Get response
+            response = outputs[0].outputs[0].text.strip()
+            
+            # Calculate metrics
+            prefill_time = (time.perf_counter() - prefill_start) * 1000
+            total_time = (time.perf_counter() - start_time) * 1000
+            num_tokens = len(outputs[0].outputs[0].token_ids)
+            
+        else:
+            # CPU generation
+            response = self._generate_cpu(prompt)
+            prefill_time = (time.perf_counter() - prefill_start) * 1000
+            total_time = (time.perf_counter() - start_time) * 1000
+            num_tokens = len(response.split())  # Approximate
         
         metrics = {
             "prefill_ms": prefill_time,
@@ -204,6 +233,26 @@ Be friendly but efficient."""
         self.total_tokens_generated += num_tokens
         
         return response, metrics
+    
+    def _generate_cpu(self, prompt: str) -> str:
+        """Generate using CPU model"""
+        if hasattr(self, 'cpu_model'):
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+            
+            with torch.no_grad():
+                outputs = self.cpu_model.generate(
+                    inputs.input_ids,
+                    max_new_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    do_sample=True,
+                    top_p=0.95
+                )
+            
+            response = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+            return response
+        else:
+            # Fallback response
+            return "I'm sorry, I'm having trouble processing your request right now."
     
     def process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Process a single LLM request"""
@@ -304,13 +353,14 @@ Be friendly but efficient."""
             self.temperature = new_config.get('llm_temperature', self.temperature)
             self.max_tokens = new_config.get('llm_max_tokens', self.max_tokens)
             
-            # Update sampling params
-            self.sampling_params = SamplingParams(
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                top_p=0.95,
-                repetition_penalty=1.1
-            )
+            # Update sampling params if using vLLM
+            if self.use_vllm and self.sampling_params:
+                self.sampling_params = SamplingParams(
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    top_p=0.95,
+                    repetition_penalty=1.1
+                )
     
     def check_performance(self):
         """Check if performance targets are met"""
@@ -335,7 +385,7 @@ Be friendly but efficient."""
             self.initialize_llm()
             
             # Report ready
-            self.queues['control'].put({
+            self.control_queue.put({
                 'type': 'ready',
                 'worker': 'llm',
                 'timestamp': time.time()
@@ -343,8 +393,10 @@ Be friendly but efficient."""
             
             self.logger.info("LLM worker started")
             
+            last_metrics_time = time.time()
+            
             # Main message handling loop
-            while True:
+            while self.running:
                 try:
                     # Check ASR queue with timeout
                     try:
@@ -355,7 +407,7 @@ Be friendly but efficient."""
                     
                     # Check control queue
                     try:
-                        control_msg = self.queues['control'].get_nowait()
+                        control_msg = self.control_queue.get_nowait()
                         self.handle_control_message(control_msg)
                     except:
                         pass
@@ -363,10 +415,14 @@ Be friendly but efficient."""
                     # Check performance periodically
                     self.check_performance()
                     
-                    # Log metrics
-                    if int(time.time()) % 30 == 0 and self.request_count > 0:
-                        avg_prefill = sum(self.prefill_latencies) / len(self.prefill_latencies)
-                        tokens_per_request = self.total_tokens_generated / self.request_count
+                    # Log metrics every 30 seconds
+                    if time.time() - last_metrics_time >= 30:
+                        if self.prefill_latencies:
+                            avg_prefill = sum(self.prefill_latencies) / len(self.prefill_latencies)
+                        else:
+                            avg_prefill = 0
+                            
+                        tokens_per_request = self.total_tokens_generated / self.request_count if self.request_count > 0 else 0
                         
                         self.logger.info("LLM metrics", extra={
                             "stage": "llm",
@@ -375,6 +431,7 @@ Be friendly but efficient."""
                             "avg_tokens_per_request": tokens_per_request,
                             "total_tokens": self.total_tokens_generated
                         })
+                        last_metrics_time = time.time()
                     
                 except KeyboardInterrupt:
                     break
@@ -382,5 +439,8 @@ Be friendly but efficient."""
                     self.logger.error(f"LLM worker error: {e}", exc_info=True)
                     time.sleep(0.1)
             
+        except Exception as e:
+            self.logger.error(f"LLM worker fatal error: {e}")
         finally:
+            self.running = False
             self.logger.info("LLM worker stopped")
