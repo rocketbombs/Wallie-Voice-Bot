@@ -67,7 +67,8 @@ class LLMWorker:
         # Use dedicated control queue
         self.control_queue = queues['llm_control']
         self.running = True
-          # System prompt
+        
+        # System prompt
         self.system_prompt = """You are Wallie, a helpful and concise voice assistant. 
 Keep responses brief and natural for spoken conversation. 
 Avoid long explanations unless specifically asked.
@@ -80,20 +81,17 @@ Be friendly but efficient."""
         return logger
     
     def initialize_llm(self):
-        """Initialize LLM engine with memory-efficient fallback strategy"""
+        """Initialize LLM engine with CPU fallback"""
         try:
             self.logger.info(f"Loading LLM: {self.model_name}")
             
-            # Force CPU model for memory efficiency if model is large
-            large_models = ["llama", "falcon", "mistral", "mixtral"]
-            is_large_model = any(model in self.model_name.lower() for model in large_models)
-            
-            if not self.use_vllm or is_large_model:
-                self.logger.info("Using CPU model for memory efficiency")
+            if not self.use_vllm:
+                self.logger.warning("vLLM not available or no GPU, using CPU fallback")
+                # TODO: Add transformers CPU fallback
                 self._initialize_cpu_model()
                 return
             
-            # Only proceed with vLLM for small models
+            # Initialize vLLM
             self.sampling_params = SamplingParams(
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
@@ -101,35 +99,40 @@ Be friendly but efficient."""
                 repetition_penalty=1.1
             )
             
-            # Check available GPU memory before loading
+            # Calculate GPU memory allocation
             if torch.cuda.is_available():
                 total_memory = torch.cuda.get_device_properties(0).total_memory
-                free_memory = total_memory - torch.cuda.memory_allocated()
-                required_memory = 2 * 1024**3  # Require at least 2GB free
-                
-                if free_memory < required_memory:
-                    self.logger.warning(f"Insufficient GPU memory ({free_memory/1024**3:.1f}GB free), using CPU")
-                    self._initialize_cpu_model()
-                    return
-              # Initialize vLLM with conservative settings
+                allocated_memory = int(total_memory * self.gpu_memory_fraction)
+                gpu_memory_gb = allocated_memory / (1024**3)
+                self.logger.info(f"Allocating {gpu_memory_gb:.1f}GB GPU memory for LLM")
+            
+            # Initialize vLLM with performance optimizations
             self.llm = LLM(
                 model=self.model_name,
                 trust_remote_code=True,
-                dtype="auto",
-                gpu_memory_utilization=min(self.gpu_memory_fraction, 0.3),  # Cap at 30%
-                max_model_len=1024,  # Reduced context
-                enforce_eager=True,  # Avoid CUDA graphs for memory
-                enable_prefix_caching=False,  # Disable caching to save memory
-                disable_log_stats=True,
+                dtype="auto",  # Let vLLM choose optimal dtype
+                gpu_memory_utilization=self.gpu_memory_fraction,
+                max_model_len=2048,  # Limit context for speed
+                enforce_eager=False,  # Use CUDA graphs
+                enable_prefix_caching=True,  # Cache common prefixes
+                disable_log_stats=True,  # Reduce overhead
                 tensor_parallel_size=1
             )
             
-            self.logger.info("vLLM loaded successfully")
+            # Warm up with dummy request
+            self.logger.info("Warming up LLM...")
+            self._generate("Hello", use_history=False)
+            
+            self.logger.info("LLM ready")
+            
+        except torch.cuda.OutOfMemoryError:
+            self.logger.error("GPU OOM during LLM init, reducing memory fraction")
+            self.gpu_memory_fraction *= 0.8
+            torch.cuda.empty_cache()
+            self.initialize_llm()
             
         except Exception as e:
-            self.logger.error(f"vLLM initialization failed: {e}")            # Clear any partial GPU allocations
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self.logger.error(f"Failed to initialize LLM: {e}")
             self._initialize_cpu_model()
     
     def _initialize_cpu_model(self):
@@ -140,20 +143,15 @@ Be friendly but efficient."""
             self.logger.info("Initializing CPU model with transformers")
             self.use_vllm = False
             
-            # Use the original lightweight model
-            cpu_model_name = self.model_name
+            # Use a smaller model for CPU
+            cpu_model_name = "microsoft/phi-2"  # 2.7B model
             
-            # Simple direct model loading approach
             self.tokenizer = AutoTokenizer.from_pretrained(cpu_model_name)
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-            
             self.cpu_model = AutoModelForCausalLM.from_pretrained(
                 cpu_model_name,
                 torch_dtype=torch.float32,
-                low_cpu_mem_usage=True
+                device_map="cpu"
             )
-            self.cpu_model.to("cpu")
             
             self.logger.info("CPU model ready")
             
@@ -227,7 +225,8 @@ Be friendly but efficient."""
             "prefill_ms": prefill_time,
             "total_ms": total_time,
             "tokens": num_tokens,
-            "tokens_per_sec": num_tokens / (total_time / 1000) if total_time > 0 else 0        }
+            "tokens_per_sec": num_tokens / (total_time / 1000) if total_time > 0 else 0
+        }
         
         # Track performance
         self.prefill_latencies.append(prefill_time)
@@ -237,30 +236,23 @@ Be friendly but efficient."""
     
     def _generate_cpu(self, prompt: str) -> str:
         """Generate using CPU model"""
-        try:
-            # Use direct model approach (simpler and more reliable)
-            if hasattr(self, 'cpu_model') and hasattr(self, 'tokenizer'):
-                inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-                
-                with torch.no_grad():
-                    outputs = self.cpu_model.generate(
-                        inputs.input_ids,
-                        max_new_tokens=self.max_tokens,
-                        temperature=self.temperature,
-                        do_sample=True,
-                        top_p=0.95,
-                        pad_token_id=self.tokenizer.eos_token_id,
-                        attention_mask=inputs.get('attention_mask', None)
-                    )
-                
-                response = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-                return response.strip()
-                
-        except Exception as e:
-            self.logger.error(f"CPU generation failed: {e}")
-        
-        # Ultimate fallback response
-        return "I'm sorry, I'm having trouble processing your request right now."
+        if hasattr(self, 'cpu_model'):
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+            
+            with torch.no_grad():
+                outputs = self.cpu_model.generate(
+                    inputs.input_ids,
+                    max_new_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    do_sample=True,
+                    top_p=0.95
+                )
+            
+            response = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+            return response
+        else:
+            # Fallback response
+            return "I'm sorry, I'm having trouble processing your request right now."
     
     def process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Process a single LLM request"""

@@ -1,0 +1,124 @@
+# Wallie Voice Bot - Linux Production Configuration
+# Optimized for RTX 3080 + 16GB RAM
+
+[general]
+wake_word = "wallie"
+wake_word_sensitivity = 0.7
+log_level = "INFO"
+enable_debug = false
+
+[audio]
+# Linux ALSA optimization
+sample_rate = 16000
+chunk_size = 1024
+channels = 1
+device_index = null  # Auto-detect best device
+buffer_duration_ms = 50  # Lower latency on Linux
+
+[vad]
+# Voice Activity Detection
+model = "silero_vad"
+threshold = 0.7
+min_speech_duration_ms = 300
+max_speech_duration_ms = 30000
+min_silence_duration_ms = 500
+speech_pad_ms = 100
+
+[asr]
+# Automatic Speech Recognition - Enhanced for Linux
+model = "small.en"  # Upgraded from tiny.en for better accuracy
+device = "cuda"
+compute_type = "float16"
+beam_size = 5
+best_of = 5
+patience = 1.0
+length_penalty = 1.0
+repetition_penalty = 1.0
+no_repeat_ngram_size = 0
+temperature = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+compression_ratio_threshold = 2.4
+log_prob_threshold = -1.0
+no_speech_threshold = 0.6
+batch_size = 16  # Better batching on Linux
+
+[llm]
+# Large Language Model - Full Linux optimization
+model = "meta-llama/Llama-3.2-3B-Instruct"
+max_tokens = 256
+temperature = 0.7
+top_p = 0.9
+top_k = 50
+frequency_penalty = 0.0
+presence_penalty = 0.0
+repetition_penalty = 1.1
+gpu_memory_fraction = 0.6  # Can use more on Linux
+tensor_parallel_size = 1
+swap_space = 4  # GB
+cpu_offload_gb = 0
+max_num_batched_tokens = 2048
+max_num_seqs = 256
+max_paddings = 256
+block_size = 16
+max_seq_len_to_capture = 8192
+disable_custom_all_reduce = false
+
+[tts]
+# Text-to-Speech - Linux native optimization
+engine = "edge-tts"  # Better Windows compatibility, fallback available
+voice = "en-US-AriaNeural"
+language = "en"
+speed = 1.1  # Slightly faster for responsiveness
+pitch = 0
+volume = 0.8
+output_format = "audio-24khz-48kbitrate-mono-mp3"
+
+[performance]
+# Performance tuning for Linux
+watchdog_interval_sec = 1
+enable_prometheus = true
+prometheus_port = 8000
+archive_transcripts = true
+max_concurrent_requests = 4
+worker_timeout_sec = 30
+queue_timeout_sec = 5
+response_timeout_sec = 10
+
+# Linux-specific optimizations
+use_memory_mapping = true
+preload_models = true
+optimize_memory = true
+use_fast_attention = true
+enable_kv_cache = true
+
+[system]
+# System resource management
+max_memory_usage_gb = 14  # Leave 2GB for system
+max_gpu_memory_usage_gb = 14  # Leave 2GB GPU memory
+cpu_threads = 8  # Adjust based on your CPU
+use_numa = false
+pin_memory = true
+
+[logging]
+# Enhanced logging for production
+log_file = "~/.wallie_voice_bot/logs/wallie.log"
+max_log_size_mb = 100
+backup_count = 5
+log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+log_worker_stats = true
+log_performance_metrics = true
+
+[security]
+# Security settings
+enable_api_key = false
+allowed_hosts = ["localhost", "127.0.0.1"]
+max_request_size_mb = 10
+rate_limit_requests_per_minute = 60
+
+[experimental]
+# Experimental features for Linux
+enable_stream_processing = true
+use_torch_compile = true  # PyTorch 2.0+ optimization
+enable_flash_attention = true  # If available
+use_better_transformer = true
+enable_cpu_fallback = true
+dynamic_batching = true

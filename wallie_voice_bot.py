@@ -4,6 +4,11 @@ Wallie Voice Bot - Production-grade offline voice assistant daemon
 Target: ≤250ms end-to-end latency from speech end to first audio
 """
 
+import os
+# Fix OpenMP conflict issues with multiple ML libraries
+os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+
 import asyncio
 import signal
 import sys
