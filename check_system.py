@@ -167,7 +167,7 @@ def check_memory():
         mem = psutil.virtual_memory()
         total_gb = mem.total / (1024**3)
         
-        if total_gb >= 16:
+        if total_gb >= 15.5:  # Allow for some variation in reported memory
             print_status("System RAM", f"OK ({total_gb:.1f}GB)")
             return True
         else:

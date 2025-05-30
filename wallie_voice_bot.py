@@ -17,12 +17,22 @@ try:
     from pydantic_settings import BaseSettings
 except ImportError:
     from pydantic import BaseSettings
+
+# Type alias to help with static analysis
+ConfigBaseClass = BaseSettings
 import toml
 import logging
 import json
 from datetime import datetime
 import psutil
 import queue as Queue  # Add at top with other imports
+
+# Try importing torch for GPU monitoring
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 # Import worker modules
 from workers.asr_worker import ASRWorker
@@ -64,7 +74,7 @@ def stage_timer(stage_name: str, budget_ms: float):
                 
                 if elapsed_ms > budget_ms:
                     self = args[0] if args else None
-                    if hasattr(self, '_overrun_count'):
+                    if self is not None and hasattr(self, '_overrun_count'):
                         self._overrun_count[stage_name] = self._overrun_count.get(stage_name, 0) + 1
                         if self._overrun_count[stage_name] >= 2:
                             raise StageOverrunError(f"{stage_name} exceeded {budget_ms}ms budget twice")
@@ -72,24 +82,25 @@ def stage_timer(stage_name: str, budget_ms: float):
                 return result
             except Exception as e:
                 elapsed_ms = (time.perf_counter() - start) * 1000
+                logger = logging.getLogger(__name__)
                 logger.error(f"{stage_name} failed after {elapsed_ms}ms: {e}")
                 raise
         return wrapper
     return decorator
 
-class WallieConfig(BaseSettings):
+class WallieConfig(BaseSettings):  # type: ignore
     """Configuration loaded from ~/.wallie_voice_bot/config.toml"""
     wake_word: str = "wallie"
     wake_word_sensitivity: float = 0.7
     
     asr_model: str = "tiny.en"
-    asr_device: str = "cuda"
-    asr_compute_type: str = "float16"
+    asr_device: str = "cpu"  # Use CPU to conserve GPU memory for LLM
+    asr_compute_type: str = "float32"
     
-    llm_model: str = "meta-llama/Llama-3.2-3B-Instruct"
-    llm_max_tokens: int = 512
+    llm_model: str = "microsoft/DialoGPT-small"  # Much smaller model (~117MB vs 3GB)
+    llm_max_tokens: int = 100  # Reduced for faster responses
     llm_temperature: float = 0.7
-    llm_gpu_memory_fraction: float = 0.4
+    llm_gpu_memory_fraction: float = 0.2  # Reduced GPU memory usage
     
     tts_model: str = "tts_models/multilingual/multi-dataset/xtts_v2"
     tts_speaker_wav: Optional[str] = None
@@ -285,21 +296,21 @@ class WallieDaemon:
                         self.logger.error(f"{name} worker exceeded max reboots")
                         continue
                     
-                        self.logger.warning(f"Restarting {name} worker (attempt {restart_counts[name]})")
-                        
-                        # Exponential backoff
-                        await asyncio.sleep(2 ** restart_counts[name])
-                        
-                        # Restart worker
-                        worker_class = {
-                            "vad": VADWorker,
-                            "asr": ASRWorker,
-                            "llm": LLMWorker,
-                            "tts": TTSWorker
-                        }.get(name)
-                        
-                        if worker_class:
-                            self._start_worker(name, worker_class)
+                    self.logger.warning(f"Restarting {name} worker (attempt {restart_counts[name]})")
+                    
+                    # Exponential backoff
+                    await asyncio.sleep(2 ** restart_counts[name])
+                    
+                    # Restart worker
+                    worker_class = {
+                        "vad": VADWorker,
+                        "asr": ASRWorker,
+                        "llm": LLMWorker,
+                        "tts": TTSWorker
+                    }.get(name)
+                    
+                    if worker_class:
+                        self._start_worker(name, worker_class)
     
     async def handle_wake_word_interrupt(self):
         """Handle wake word interrupts with dedicated control queues"""
@@ -321,8 +332,7 @@ class WallieDaemon:
                             self.queues[queue_name].put_nowait(abort_msg)
                         except Queue.Full:
                             self.logger.error(f"Failed to send abort to {queue_name}")
-                    
-                    # Clear pipeline queues
+                      # Clear pipeline queues
                     await self.clear_pipeline_queues()
                     
                     self.metrics['session_count'] += 1
@@ -331,7 +341,7 @@ class WallieDaemon:
                 if not isinstance(e, asyncio.TimeoutError):
                     self.logger.error(f"Wake word interrupt error: {e}")
                 await asyncio.sleep(0.05)
-    
+
     async def reload_config(self):
         """Hot-reload configuration on SIGHUP"""
         self.logger.info("Reloading configuration")
@@ -342,7 +352,7 @@ class WallieDaemon:
                 if isinstance(queue, mp.Queue):
                     try:
                         queue.put_nowait({'type': 'config_reload', 'config': self.config.dict()})
-                    except mp.queues.Full:
+                    except Queue.Full:
                         pass
     
     async def clear_pipeline_queues(self):
@@ -356,9 +366,8 @@ class WallieDaemon:
                 while True:
                     try:
                         self.queues[queue_name].get_nowait()
-                    except (Queue.Empty, KeyError):
-                        break
-    
+                    except (Queue.Empty, KeyError):                        break
+
     async def run(self):
         """Main daemon loop"""
         self.running = True
@@ -367,7 +376,9 @@ class WallieDaemon:
             self.logger.info(f"Received signal {sig}")
             try:
                 loop = asyncio.get_running_loop()
-                if sig == signal.SIGHUP:
+                # Check for SIGHUP safely for reload on Unix systems
+                sighup_value = getattr(signal, 'SIGHUP', None)
+                if sighup_value is not None and sig == sighup_value:
                     loop.create_task(self.reload_config())
                 else:
                     self.running = False
@@ -377,7 +388,7 @@ class WallieDaemon:
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
-        if sys.platform != "win32":
+        if sys.platform != "win32" and hasattr(signal, 'SIGHUP'):
             signal.signal(signal.SIGHUP, signal_handler)
         
         try:
@@ -412,8 +423,7 @@ class WallieDaemon:
             # Cancel tasks
             for task in tasks:
                 task.cancel()
-            
-            # Terminate workers
+              # Terminate workers
             for name, process in self.workers.items():
                 if process.is_alive():
                     process.terminate()
@@ -426,9 +436,8 @@ class WallieDaemon:
     def _get_gpu_memory_usage(self) -> Optional[int]:
         """Get current GPU memory usage in MB"""
         try:
-            import torch
-            if torch.cuda.is_available():
-                return torch.cuda.memory_allocated() / 1024**2
+            if TORCH_AVAILABLE and torch.cuda.is_available():
+                return int(torch.cuda.memory_allocated() / 1024**2)
         except:
             pass
         return None

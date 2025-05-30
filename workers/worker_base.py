@@ -1,3 +1,11 @@
+import asyncio
+import time
+import logging
+import multiprocessing as mp
+import queue as Queue
+from typing import Dict, Any, Optional
+
+
 class WorkerBase:
     """Base class for all workers with async support"""
     
@@ -8,6 +16,12 @@ class WorkerBase:
         self.control_queue = queues[f'{name}_control']
         self.logger = self._setup_logging()
         self.running = True
+    
+    def _setup_logging(self) -> logging.Logger:
+        """Setup worker-specific logging"""
+        logger = logging.getLogger(f"wallie.{self.name}")
+        logger.setLevel(logging.INFO)
+        return logger
     
     async def handle_control_messages(self):
         """Base control message handler"""
